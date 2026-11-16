@@ -1,0 +1,6 @@
+# CPU-only PyTorch comes from the dedicated PyTorch index.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+fastapi==0.163.1
+uvicorn[standard]==0.54.0
+numpy==2.4.6

@@ -1,0 +1,19 @@
+services:
+  trainer:
+    build: .
+    image: resumable-trainer:latest
+    container_name: resumable-trainer
+    ports:
+      - "8000:8000"
+    environment:
+      RUNS_DIR: /app/runs
+      CONFIG_PATH: /app/config/default.json
+      # Set to 1 only for chaos testing (enables POST /test/crash).
+      ENABLE_TEST_CRASH_ENDPOINT: "0"
+    volumes:
+      # Checkpoints survive `docker kill` + `docker compose start`.
+      - trainer-runs:/app/runs
+    restart: unless-stopped
+
+volumes:
+  trainer-runs:

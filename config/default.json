@@ -1,0 +1,13 @@
+{
+  "seed": 1234,
+  "epochs": 8,
+  "batch_size": 32,
+  "lr": 0.01,
+  "hidden_dim": 16,
+  "dropout_p": 0.2,
+  "checkpoint_every": 1,
+  "batch_sleep_seconds": 0.05,
+  "checkpoint_sleep_seconds": 0.0,
+  "pause_timeout_seconds": 30.0,
+  "dataset_path": "data/classification.csv"
+}
