@@ -98,7 +98,10 @@ def get_config() -> dict:
 
 @app.post("/train/start")
 def start(body: dict[str, Any] | None = Body(default=None)) -> dict:
-    """Start a fresh run. Body: {"force": bool, "config": {overrides}}."""
+    """Start a fresh run. Body: {"force": bool, "config": {overrides}}.
+    If a checkpoint save of the current run is still in flight, waits for it
+    (bounded) or 409s — a discarded run's late save can never overwrite the
+    new run's checkpoint."""
     body = body or {}
     force = bool(body.get("force", False))
     overrides = body.get("config") or {}
@@ -113,7 +116,9 @@ def start(body: dict[str, Any] | None = Body(default=None)) -> dict:
 @app.post("/train/pause")
 async def pause() -> dict:
     """Stop training; responds only after the trainer stopped AND a complete
-    checkpoint is persisted.  Runs in a thread so other queries stay live."""
+    checkpoint is persisted.  Concurrent pauses share one save's conclusion
+    (all 200 or all 500 for their run).  Runs in a thread so other queries
+    stay live."""
     try:
         return await asyncio.to_thread(manager.pause)
     except PauseTimeoutError as exc:
@@ -127,7 +132,8 @@ async def pause() -> dict:
 @app.post("/train/resume")
 def resume() -> dict:
     """Resume from the paused state / latest checkpoint. Only one trainer can
-    run at a time: concurrent resumes yield exactly one 200 and 409s."""
+    run at a time: concurrent resumes yield exactly one 200 and 409s.  If a
+    checkpoint save is still in flight, waits for it (bounded) or 409s."""
     try:
         return manager.resume()
     except NotFoundError as exc:

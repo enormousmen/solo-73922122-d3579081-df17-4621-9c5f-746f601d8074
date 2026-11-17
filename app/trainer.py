@@ -4,6 +4,20 @@ One background trainer thread runs the loop below; FastAPI handlers only
 manipulate flags / wait on conditions, so slow training or slow checkpoint
 saves never block status queries.
 
+Pause/resume/start handoff (the invariants this module enforces):
+
+* While a checkpoint save is in flight (``saving``), ``resume`` and
+  ``start`` wait for it to finish (bounded, then 409) — they never mutate
+  or replace the training state mid-save, so a late save of an old run can
+  never overwrite a new run's checkpoint or health state.
+* Concurrent pauses share the outcome of ONE save: one request becomes the
+  saver, the rest wait for that save's conclusion and all report the same
+  persisted/failed result for THEIR run — never a later run's state.
+* A failed pause-save keeps the previous checkpoint intact and may be
+  retried by a later pause; a run discarded by ``force`` start is never
+  resurrected (its checkpoint file is removed only after no save of it can
+  still be in flight).
+
 Reproducibility design (bit-exact resume):
 
 * ``torch.set_num_threads(1)`` and deterministic algorithms are enabled, so a
@@ -178,8 +192,11 @@ class JobManager:
 
     def start(self, overrides: dict | None = None, force: bool = False) -> dict:
         with self._cond:
-            if self.state in (JobState.RUNNING, JobState.PAUSING):
-                raise ConflictError("training is already running")
+            # Never mutate/replace the training state while a checkpoint save
+            # is in flight (e.g. a retried pause-save): wait it out (bounded)
+            # so a late save of the old run can never land on the new run's
+            # checkpoint.  RUNNING/PAUSING still conflicts immediately.
+            self._wait_out_save_and_training()
             if self.run_id is not None and not force:
                 raise ConflictError(
                     "a run already exists; use POST /train/resume to continue it "
@@ -205,8 +222,10 @@ class JobManager:
 
     def resume(self) -> dict:
         with self._cond:
-            if self.state in (JobState.RUNNING, JobState.PAUSING):
-                raise ConflictError("training is already running")
+            # Wait out any in-flight checkpoint save (bounded) instead of
+            # mutating the training state mid-save; RUNNING/PAUSING conflicts
+            # immediately.
+            self._wait_out_save_and_training()
             if self.run_id is None or self.cfg is None:
                 raise NotFoundError("no run or checkpoint to resume from")
             if self.state == JobState.FINISHED:
@@ -224,25 +243,57 @@ class JobManager:
             self._thread.start()
             return self.status()
 
+    def _save_wait_timeout(self) -> float:
+        """Upper bound (seconds) for start/resume to wait out an in-flight save."""
+        if self.cfg is not None:
+            return self.cfg.pause_timeout_seconds
+        return 30.0
+
+    def _wait_out_save_and_training(self) -> None:
+        """Must be called under ``self._cond``.
+
+        Returns only when no trainer is running AND no checkpoint save is in
+        flight, so the caller can safely mutate or replace the training state.
+        RUNNING/PAUSING conflicts immediately; an in-flight save is waited out
+        for a bounded time, then rejected with a conflict (explicit refusal).
+        """
+        deadline = time.monotonic() + self._save_wait_timeout()
+        while True:
+            if self.state in (JobState.RUNNING, JobState.PAUSING):
+                raise ConflictError("training is already running")
+            if not self.saving:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConflictError(
+                    "a checkpoint save is still in progress; "
+                    "retry the request in a moment")
+            self._cond.wait(remaining)
+
     def pause(self) -> dict:
-        """Stop training and return only after a full checkpoint is persisted."""
-        do_inline_retry = False
+        """Stop training and return only after a full checkpoint is persisted.
+
+        Concurrent pauses share the outcome of ONE save: the first becomes the
+        saver, the others wait for that save's conclusion — all of them then
+        report the same persisted (200) / failed (500) result for THEIR run,
+        never a later run's state.  While the save is in flight, resume/start
+        wait (or 409), so the stopped training state is never mutated mid-save.
+        """
         with self._cond:
             if self.state == JobState.RUNNING:
                 self._pause_requested = True
                 self.state = JobState.PAUSING
-            elif self.state == JobState.PAUSED and self.checkpoint_dirty:
-                do_inline_retry = True      # retry the failed pause-save
-            elif self.state == JobState.PAUSED:
-                return self.status()        # already paused and persisted
-            elif self.state == JobState.PAUSING:
-                pass                        # concurrent pause: just wait
+            elif self.state in (JobState.PAUSING, JobState.PAUSED):
+                pass  # join an in-flight pause, or retry a failed pause-save
             else:
                 raise ConflictError(f"cannot pause while state={self.state.value}")
 
-            if not do_inline_retry:
-                timeout = self.cfg.pause_timeout_seconds if self.cfg else 30.0
-                deadline = time.monotonic() + timeout
+            timeout = self.cfg.pause_timeout_seconds if self.cfg else 30.0
+            deadline = time.monotonic() + timeout
+            waited_on_save = False
+
+            while True:
+                # Phase 1: wait for the trainer thread to stop.
                 while self.state == JobState.PAUSING:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -251,22 +302,68 @@ class JobManager:
                             f"{timeout}s; pause is still in progress, "
                             "poll GET /train/status")
                     self._cond.wait(remaining)
+
                 if self.state == JobState.FINISHED:
                     # The last batch completed before the pause landed; the run
                     # is stopped and the final checkpoint is persisted.
                     return self.status()
+                if self.state == JobState.RUNNING:
+                    # A concurrent resume restarted the trainer before this
+                    # pause could save; re-request the pause and wait again.
+                    self._pause_requested = True
+                    self.state = JobState.PAUSING
+                    continue
+                # state == PAUSED: trainer stopped.  Ensure the checkpoint is
+                # persisted (retrying the save if the trainer's pause-save
+                # failed and left the checkpoint dirty).
+                if not self.checkpoint_dirty:
+                    return self.status()
+                if self.saving:
+                    # A concurrent pause is already retrying the save: wait for
+                    # its outcome instead of starting a competing save.
+                    waited_on_save = True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise PauseTimeoutError(
+                            "a checkpoint save is still in progress; "
+                            "poll GET /train/status")
+                    self._cond.wait(remaining)
+                    continue
+                if waited_on_save:
+                    # The save we waited on concluded and the checkpoint is
+                    # still dirty: it failed.  Concurrent pauses share that
+                    # conclusion; a later pause request may retry.
+                    raise CheckpointSaveError(
+                        "training is stopped but the checkpoint could not be "
+                        "persisted; the previous checkpoint is intact on disk "
+                        "and the pause can be retried. "
+                        f"cause: {self.last_error or 'checkpoint save failed'}")
+                # Become the saver: mark saving under the lock so resume/start
+                # wait, then save outside the lock (queries stay responsive).
+                self.saving = True
+                break
 
-        # State is PAUSED here.  If the trainer's pause-save failed, retry it
-        # once inline (outside the lock, so queries stay responsive).
-        if self.checkpoint_dirty:
-            try:
-                self._save_checkpoint()
-            except CheckpointError as exc:
-                raise CheckpointSaveError(
-                    f"training is stopped but the checkpoint could not be "
-                    f"persisted; the previous checkpoint is intact on disk and "
-                    f"the pause can be retried. cause: {exc}") from exc
-        return self.status()
+        # Saver path (outside the lock): persist the stopped trainer's state.
+        # keep_saving=True defers the saving=False + notify to this thread so
+        # a queued resume/start cannot overtake this pause's response.
+        try:
+            self._save_checkpoint(keep_saving=True)
+        except CheckpointError as exc:
+            with self._cond:
+                self.saving = False
+                self._cond.notify_all()
+            raise CheckpointSaveError(
+                f"training is stopped but the checkpoint could not be "
+                f"persisted; the previous checkpoint is intact on disk and "
+                f"the pause can be retried. cause: {exc}") from exc
+        with self._cond:
+            self.saving = False
+            # Capture the conclusion for the run THIS pause stopped.  Even if
+            # a queued resume/start flips the state right after, this request
+            # still returns its own run's paused state.
+            result = self.status()
+            self._cond.notify_all()
+        return result
 
     # ------------------------------------------------------------- train loop
 
@@ -346,42 +443,75 @@ class JobManager:
 
     # -------------------------------------------------------------- checkpoint
 
-    def _save_checkpoint(self, force: bool = False) -> None:
-        point = (self.epoch, self.next_batch)
-        payload = {
-            "run_id": self.run_id,
-            "config": self.cfg.to_dict(),
-            "epoch": self.epoch,
-            "next_batch": self.next_batch,
-            "completed": self.completed,
-            "losses": self.losses,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "rng_state": torch.get_rng_state(),
-            "started_at": self.started_at,
-            "saved_at": _now_iso(),
-        }
-        with self._save_lock:
+    def _save_checkpoint(self, force: bool = False, keep_saving: bool = False) -> None:
+        """Persist the current training state.
+
+        The payload is snapshotted under ``self._cond`` and ``saving`` is set
+        in the same critical section, so start/resume can never slip in
+        between and mutate the state being saved.  The (possibly slow) write
+        itself happens outside ``self._cond`` — queries stay responsive — and
+        is serialized through ``self._save_lock``.
+
+        If the run was replaced while the save was pending (cannot happen in
+        practice because start/resume wait for ``saving``; kept as a safety
+        net), the stale save is discarded instead of overwriting the new run's
+        checkpoint or health state.
+
+        ``keep_saving=True`` (used by the pause saver) leaves ``saving=True``
+        and skips the notify on completion; the caller then captures the
+        paused status and releases waiters itself, so a queued resume/start
+        cannot overtake the pause's own response.
+        """
+        with self._cond:
+            point = (self.epoch, self.next_batch)
             if not force and not self.checkpoint_dirty and self._saved_point == point:
                 return  # this exact point is already persisted
-            with self._cond:
-                self.saving = True
-            try:
-                save_checkpoint(self.runs_dir, payload,
-                                save_delay_seconds=self.cfg.checkpoint_sleep_seconds)
-            except CheckpointError as exc:
+            run_id = self.run_id
+            save_delay = self.cfg.checkpoint_sleep_seconds
+            payload = {
+                "run_id": run_id,
+                "config": self.cfg.to_dict(),
+                "epoch": self.epoch,
+                "next_batch": self.next_batch,
+                "completed": self.completed,
+                "losses": list(self.losses),
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "rng_state": torch.get_rng_state(),
+                "started_at": self.started_at,
+                "saved_at": _now_iso(),
+            }
+            # Set only after the snapshot succeeded; still the same critical
+            # section, so start/resume cannot interleave either way.
+            self.saving = True
+        try:
+            with self._save_lock:
                 with self._cond:
-                    self.saving = False
+                    if self.run_id != run_id:
+                        raise CheckpointError(
+                            "run was replaced while the save was pending; "
+                            "discarding the stale save")
+                save_checkpoint(self.runs_dir, payload,
+                                save_delay_seconds=save_delay)
+        except CheckpointError as exc:
+            with self._cond:
+                if self.run_id == run_id:
                     self.checkpoint_dirty = True
                     self.last_error = (f"checkpoint save failed at "
                                        f"epoch={point[0]} batch={point[1]}: {exc}")
-                raise
-            with self._cond:
-                self.saving = False
+                if not keep_saving:
+                    self.saving = False
+                    self._cond.notify_all()
+            raise
+        with self._cond:
+            if self.run_id == run_id:
                 self.checkpoint_dirty = False
                 self.last_error = None
                 self._saved_point = point
                 self.last_checkpoint_at = _now_iso()
+            if not keep_saving:
+                self.saving = False
+                self._cond.notify_all()
 
     # ----------------------------------------------------------------- queries
 

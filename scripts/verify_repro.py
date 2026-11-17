@@ -17,6 +17,15 @@ baseline (identical seed + config):
                                          new) checkpoint, resume reproduces
                                          G-baseline
   H   service basics                  -> /, /docs, 404s before first checkpoint
+  I   pause save-retry vs resume      -> resume waits out the in-flight save;
+                                         the retried pause returns its own
+                                         run's paused state (never "running")
+  J   pause save-retry vs force-start -> force-start waits out the save; the
+                                         discarded run's late save never
+                                         overwrites the new run's checkpoint
+  K   two concurrent pauses           -> both share one save's conclusion
+                                         (both 500 on failure, both 200 paused
+                                         after a retry); result == baseline
 
 Exit code 0 iff every scenario passes.  Run from the repo root:
 
@@ -53,6 +62,11 @@ CFG_SLOW_SAVE = {"epochs": 1, "batch_size": 32, "batch_sleep_seconds": 0.03,
 # Scenario G: kill mid-save, short run.
 CFG_KILL_SAVE = {"epochs": 1, "batch_size": 32, "batch_sleep_seconds": 0.03,
                  "checkpoint_every": 1, "checkpoint_sleep_seconds": 0.5}
+# Scenarios I/J/K: 1s saves open a window where a retried pause's save is
+# still in flight when a concurrent resume / force-start / pause arrives.
+CFG_HANDOFF = {"epochs": 2, "batch_size": 32, "batch_sleep_seconds": 0.03,
+               "checkpoint_every": 10, "checkpoint_sleep_seconds": 1.0}
+CFG_HANDOFF_SEED99 = {**CFG_HANDOFF, "seed": 99}
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -336,6 +350,150 @@ def scenario_slow_save_queries(port: int) -> None:
     record("F3 slow-save run finishes", st["state"] == "finished")
 
 
+def scenario_pause_retry_vs_resume(port: int, runs_dir: Path,
+                                   ref: tuple[list, bytes]) -> None:
+    print("\n== I: pause save-retry hands off to a concurrent resume ==")
+    start_run(port, CFG_HANDOFF)
+    wait_until(port, lambda s: s["completed_batches"] >= 6
+               and s["last_checkpoint_at"] is not None)
+    flag = runs_dir / "INJECT_SAVE_FAILURES"
+    flag.write_text("1")
+    code, body = api(port, "POST", "/train/pause")
+    record("I1 pause with failing save -> 500", code == 500,
+           str(body.get("detail", ""))[:80])
+    code, st = api(port, "GET", "/train/status")
+    assert st["state"] == "paused" and st["checkpoint_dirty"], st
+    flag.unlink()                                # fix the "storage"
+
+    pause_result: dict = {}
+
+    def retry_pause():
+        pause_result["code"], pause_result["body"] = api(
+            port, "POST", "/train/pause", timeout=60)
+
+    t = threading.Thread(target=retry_pause)
+    t.start()
+    wait_until(port, lambda s: s["saving"], timeout=30)  # retry save in flight
+    t0 = time.monotonic()
+    code, st = api(port, "POST", "/train/resume", timeout=60)
+    dt = time.monotonic() - t0
+    t.join()
+    record("I2 resume during save-retry waits for the save, then resumes",
+           code == 200 and st["state"] == "running" and dt > 0.5,
+           f"got {code} after {dt:.2f}s")
+    record("I3 retried pause returns its own run's paused state (not running)",
+           pause_result.get("code") == 200
+           and pause_result["body"].get("state") == "paused",
+           f"got {pause_result.get('code')} "
+           f"{pause_result.get('body', {}).get('state')}")
+    wait_state(port, "finished", timeout=120)
+    _, losses = api(port, "GET", "/train/losses")
+    params = api_bytes(port, "/train/parameters")
+    compare_to_baseline("I4 run after pause/retry/resume == baseline",
+                        ref[0], ref[1], losses["losses"], params)
+
+
+def scenario_pause_retry_vs_force_start(port: int, runs_dir: Path) -> None:
+    print("\n== J: pause save-retry hands off to a concurrent force-start ==")
+    print("  (baseline: seed=99 config, uninterrupted)")
+    ref_losses, ref_params = run_to_finish(port, CFG_HANDOFF_SEED99)
+    start_run(port, CFG_HANDOFF)
+    wait_until(port, lambda s: s["completed_batches"] >= 6
+               and s["last_checkpoint_at"] is not None)
+    old_run = api(port, "GET", "/train/status")[1]["run_id"]
+    flag = runs_dir / "INJECT_SAVE_FAILURES"
+    flag.write_text("1")
+    code, _ = api(port, "POST", "/train/pause")
+    record("J1 pause with failing save -> 500", code == 500)
+    flag.unlink()
+
+    pause_result: dict = {}
+
+    def retry_pause():
+        pause_result["code"], pause_result["body"] = api(
+            port, "POST", "/train/pause", timeout=60)
+
+    t = threading.Thread(target=retry_pause)
+    t.start()
+    wait_until(port, lambda s: s["saving"], timeout=30)  # retry save in flight
+    code, st = api(port, "POST", "/train/start",
+                   {"force": True, "config": CFG_HANDOFF_SEED99}, timeout=60)
+    new_run = st.get("run_id")
+    t.join()
+    record("J2 force-start during save-retry waits, then starts a new run",
+           code == 200 and new_run and new_run != old_run, f"got {code}")
+    record("J3 retried pause returns its own run's paused state",
+           pause_result.get("code") == 200
+           and pause_result["body"].get("state") == "paused"
+           and pause_result["body"].get("run_id") == old_run,
+           f"got {pause_result.get('code')} "
+           f"{pause_result.get('body', {}).get('state')} "
+           f"run={pause_result.get('body', {}).get('run_id')}")
+    code, _ = api(port, "GET", "/train/checkpoint")
+    record("J4 discarded run's checkpoint is gone once the new run starts",
+           code == 404, f"got {code}")
+    wait_until(port, lambda s: s["last_checkpoint_at"] is not None, timeout=60)
+    ckpt = torch.load(io.BytesIO(api_bytes(port, "/train/checkpoint")),
+                      weights_only=True)
+    record("J5 late save of old run did not overwrite the new checkpoint",
+           ckpt["run_id"] == new_run, f"checkpoint run_id={ckpt['run_id']}")
+    wait_state(port, "finished", timeout=120)
+    _, losses = api(port, "GET", "/train/losses")
+    params = api_bytes(port, "/train/parameters")
+    compare_to_baseline("J6 new run == seed=99 baseline", ref_losses, ref_params,
+                        losses["losses"], params)
+
+
+def scenario_concurrent_pause(port: int, runs_dir: Path,
+                              ref: tuple[list, bytes]) -> None:
+    print("\n== K: concurrent pauses share one save conclusion ==")
+    start_run(port, CFG_HANDOFF)
+    wait_until(port, lambda s: s["completed_batches"] >= 6
+               and s["last_checkpoint_at"] is not None)
+    flag = runs_dir / "INJECT_SAVE_FAILURES"
+    flag.write_text("1")
+
+    results: list = []
+
+    def do_pause():
+        results.append(api(port, "POST", "/train/pause", timeout=60))
+
+    threads = [threading.Thread(target=do_pause) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    codes = sorted(r[0] for r in results)
+    record("K1 concurrent pauses with failing save -> both get the failure",
+           codes == [500, 500], f"got {codes}")
+    code, st = api(port, "GET", "/train/status")
+    record("K2 checkpoint still dirty, run paused",
+           st["state"] == "paused" and st["checkpoint_dirty"])
+    flag.unlink()                                # fix the "storage"
+
+    results.clear()
+    threads = [threading.Thread(target=do_pause) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    codes = sorted(r[0] for r in results)
+    states = sorted(r[1].get("state", "?") for r in results)
+    record("K3 concurrent pause retries -> both get the success (paused)",
+           codes == [200, 200] and states == ["paused", "paused"],
+           f"got {codes} {states}")
+    code, st = api(port, "GET", "/train/status")
+    record("K4 checkpoint persisted by the shared save",
+           not st["checkpoint_dirty"])
+    code, _ = api(port, "POST", "/train/resume")
+    record("K5 resume after concurrent pauses", code == 200)
+    wait_state(port, "finished", timeout=120)
+    _, losses = api(port, "GET", "/train/losses")
+    params = api_bytes(port, "/train/parameters")
+    compare_to_baseline("K6 run after concurrent pauses == baseline",
+                        ref[0], ref[1], losses["losses"], params)
+
+
 def scenario_kill_restart(runs_dir: Path, log_dir: Path, server: Server,
                           ref: tuple[list, bytes]) -> Server:
     print("\n== C: hard crash + restart recovers from latest checkpoint ==")
@@ -440,6 +598,15 @@ def main() -> int:
         scenario_concurrent_resume(server.port, (ref_losses, ref_params))
         scenario_save_failure_retry(server.port, runs_dir, (ref_losses, ref_params))
         scenario_slow_save_queries(server.port)
+
+        print("\n== A2: handoff-scenarios baseline (CFG_HANDOFF) ==")
+        ref_handoff = run_to_finish(server.port, CFG_HANDOFF)
+        record("A2 handoff baseline finished", True,
+               f"{len(ref_handoff[0])} batches")
+
+        scenario_pause_retry_vs_resume(server.port, runs_dir, ref_handoff)
+        scenario_pause_retry_vs_force_start(server.port, runs_dir)
+        scenario_concurrent_pause(server.port, runs_dir, ref_handoff)
 
         server = scenario_kill_restart(runs_dir, log_dir, server,
                                        (ref_losses, ref_params))

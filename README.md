@@ -85,9 +85,67 @@ curl -OJ localhost:8000/train/parameters     # model_parameters.pt
 curl -OJ localhost:8000/train/checkpoint     # checkpoint.pt
 ```
 
+### 演示：暂停保存失败重试与并发交接
+
+```bash
+# 1) 用慢保存配置启动（checkpoint_sleep_seconds=1 放大保存窗口，便于观察）
+curl -X POST localhost:8000/train/start -H 'Content-Type: application/json' \
+     -d '{"force": true, "config": {"epochs": 2, "checkpoint_every": 10,
+          "checkpoint_sleep_seconds": 1.0}}'
+
+# 2) 模拟存储故障：在 runs 目录创建故障注入文件（compose 下为 trainer-runs 卷）
+docker compose exec trainer touch /app/runs/INJECT_SAVE_FAILURES
+curl -X POST localhost:8000/train/pause
+#  -> 500：训练已停，但检查点未能持久化；旧检查点完好，状态为 paused+dirty
+curl -s localhost:8000/train/status | jq '.state, .checkpoint_dirty, .last_error'
+
+# 3) 修复存储后重试暂停（保存需 ~1s）；同时在另一个终端立即发续训：
+docker compose exec trainer rm /app/runs/INJECT_SAVE_FAILURES
+curl -X POST localhost:8000/train/pause &        # 重试暂停（保存者）
+curl -X POST localhost:8000/train/resume         # 并发续训：等待保存结束后才放行
+#  -> 暂停返回 200 且 state=paused（本作业的结论，不是 running）；
+#     续训在保存结束后返回 200 并继续训练。
+
+# 4) 并发暂停共享同一结论：再次注入故障后同时发两个暂停
+docker compose exec trainer touch /app/runs/INJECT_SAVE_FAILURES
+curl -X POST localhost:8000/train/pause & curl -X POST localhost:8000/train/pause & wait
+#  -> 两个请求都得到 500（同一次保存失败的结论），旧检查点完好
+docker compose exec trainer rm /app/runs/INJECT_SAVE_FAILURES
+curl -X POST localhost:8000/train/pause & curl -X POST localhost:8000/train/pause & wait
+#  -> 两个请求都得到 200 + state=paused（共享同一次成功保存）
+
+# 5) 暂停重试保存进行中 force 新开：新开会等待旧保存结束，
+#    旧作业的迟到保存不会改写新作业的检查点
+curl -X POST localhost:8000/train/start -H 'Content-Type: application/json' \
+     -d '{"force": true, "config": {"seed": 99}}'
+```
+
+以上交互均可在 `/docs`（Swagger UI）中直接操作；故障注入文件路径在 compose
+中为容器内 `/app/runs/INJECT_SAVE_FAILURES`（本地运行为 `$RUNS_DIR/` 下）。
+
 状态机：`idle → running ⇄ pausing → paused → running … → finished`（异常为
 `failed`）。`paused` 表示训练已停、可续训；`checkpoint_dirty=true` 表示内存进度
 领先于磁盘（上次保存失败），此时重启进程会回退到磁盘上的旧检查点。
+
+### 并发与交接语义（暂停重试 / 作业切换）
+
+- **保存进行中不交接**：`saving=true`（有检查点保存在飞，例如暂停保存失败后的
+  重试保存）时，`/train/resume` 与 `/train/start`（含 `force=true`）会**有界等
+  待**保存结束再执行；等待超过 `pause_timeout_seconds` 则明确返回 409，可稍后
+  重试。绝不会在保存进行中修改或替换正在保存的训练现场。
+- **并发暂停共享同一保存结论**：多个 `/train/pause` 同时到达时，第一个请求成
+  为"保存者"，其余等待**同一次保存**的结果——要么全部 200（已持久化），要么
+  全部 500（保存失败、旧检查点完好、可重试）。暂停响应返回的是**它暂停的那个
+  作业**的 `paused` 状态；即使与此同时有续训/新开请求排在后面，也不会返回后来
+  作业的状态（如 `running` 或新作业的 `run_id`）。
+- **新作业获准启动后，旧保存不越界**：`force=true` 只有在旧作业没有任何保存
+  在飞时才获准执行；旧作业的迟到保存不会改写新作业的检查点文件，也不会污染新
+  作业的 `checkpoint_dirty`/`last_error` 健康状态（保存完成时会校验所属
+  `run_id`，已替换则丢弃该迟到保存）。被丢弃作业的检查点文件会被删除，重启后
+  不会恢复已丢弃的作业。
+- **保存失败可重试**：暂停保存失败返回 500，训练已停、内存现场完整、磁盘上的
+  旧检查点不动；修复存储后再次 `/train/pause` 即可重试持久化，或直接
+  `/train/resume` 从内存现场继续训练（下次保存会带上最新进度）。
 
 ## 可复现性设计（为什么恢复后逐位一致）
 
@@ -118,8 +176,11 @@ python3 scripts/verify_repro.py
 脚本会真实拉起 uvicorn 服务进程，依次验证（详见脚本 docstring）：
 A 不中断基线；B 暂停+续训；C 强退+重启+续训；D 并发续训只放行一个；
 E1 保存失败→报错→旧点保留→重试成功；E2 保存失败后强退→回退旧点恢复；
-F 慢保存不挡查询；G 保存进行中强退→恢复完整旧/新点；H 基础接口与 /docs。
-B–E、G 的逐批损失与最终参数均与各自不中断基线**逐位一致**才判通过。
+F 慢保存不挡查询；G 保存进行中强退→恢复完整旧/新点；H 基础接口与 /docs；
+I 暂停重试的保存进行中发续训→续训等待保存结束、暂停返回本作业的 paused；
+J 暂停重试的保存进行中 force 新开→新开等待、旧保存不越界、新作业正常复现；
+K 并发暂停共享同一保存结论（失败同 500、重试同 200）。
+B–E、G、I–K 的逐批损失与最终参数均与各自不中断基线**逐位一致**才判通过。
 
 > 本环境的 seccomp 策略禁止向其他进程发信号，脚本用 `ENABLE_TEST_CRASH_ENDPOINT=1`
 > 开启的测试专用 `POST /test/crash`（`os._exit`，立即死亡、无任何清理）模拟强退；
@@ -147,7 +208,7 @@ curl -s localhost:8000/train/status    # 直至 state=finished
 （以下为 `python3 scripts/verify_repro.py` 在本仓库环境下的真实输出摘要）
 
 ```
-    workdir: /tmp/verify-repro-ndor_el1
+    workdir: /tmp/verify-repro-kabve2pq
     
     == H: service basics (idle server) ==
       [PASS] H1 GET /
@@ -183,9 +244,41 @@ curl -s localhost:8000/train/status    # 直至 state=finished
       [PASS] E1 run after save-failure == uninterrupted
     
     == F: slow checkpoint saves do not block queries ==
-      [PASS] F1 queries respond fast while a 1s save is in flight - worst status latency 1ms
+      [PASS] F1 queries respond fast while a 1s save is in flight - worst status latency 2ms
       [PASS] F2 pause during slow saves
       [PASS] F3 slow-save run finishes
+    
+    == A2: handoff-scenarios baseline (CFG_HANDOFF) ==
+      [PASS] A2 handoff baseline finished - 38 batches
+    
+    == I: pause save-retry hands off to a concurrent resume ==
+      [PASS] I1 pause with failing save -> 500 - training is stopped but the checkpoint could not be persisted; the previous chec
+      [PASS] I2 resume during save-retry waits for the save, then resumes - got 200 after 1.02s
+      [PASS] I3 retried pause returns its own run's paused state (not running) - got 200 paused
+        losses: 38 entries, exact match
+        params: all tensors bit-identical (sha256 2a6e15fb8366863d == 2a6e15fb8366863d)
+      [PASS] I4 run after pause/retry/resume == baseline
+    
+    == J: pause save-retry hands off to a concurrent force-start ==
+      (baseline: seed=99 config, uninterrupted)
+      [PASS] J1 pause with failing save -> 500
+      [PASS] J2 force-start during save-retry waits, then starts a new run - got 200
+      [PASS] J3 retried pause returns its own run's paused state - got 200 paused run=73f0cd1d24f7
+      [PASS] J4 discarded run's checkpoint is gone once the new run starts - got 404
+      [PASS] J5 late save of old run did not overwrite the new checkpoint - checkpoint run_id=1b02148fe15f
+        losses: 38 entries, exact match
+        params: all tensors bit-identical (sha256 f6e65b10803c6346 == f6e65b10803c6346)
+      [PASS] J6 new run == seed=99 baseline
+    
+    == K: concurrent pauses share one save conclusion ==
+      [PASS] K1 concurrent pauses with failing save -> both get the failure - got [500, 500]
+      [PASS] K2 checkpoint still dirty, run paused
+      [PASS] K3 concurrent pause retries -> both get the success (paused) - got [200, 200] ['paused', 'paused']
+      [PASS] K4 checkpoint persisted by the shared save
+      [PASS] K5 resume after concurrent pauses
+        losses: 38 entries, exact match
+        params: all tensors bit-identical (sha256 2a6e15fb8366863d == 2a6e15fb8366863d)
+      [PASS] K6 run after concurrent pauses == baseline
     
     == C: hard crash + restart recovers from latest checkpoint ==
       [PASS] C1 server crashed mid-run
@@ -214,9 +307,12 @@ curl -s localhost:8000/train/status    # 直至 state=finished
       [PASS] G4 kill-mid-save == uninterrupted
     
     ================ SUMMARY ================
-      33/33 checks passed（逐项明细同上，全部 PASS）
+      50/50 checks passed（逐项明细同上，全部 PASS）
 
 ```
+
+另做了 30 轮随机交错压力自测（并发 pause/resume/force-start/查询 + 随机故障
+注入）：无死锁、无异常响应、损失历史连续完整，最终可正常暂停持久化并跑完。
 
 ## 限制与未完成事项
 
@@ -224,12 +320,14 @@ curl -s localhost:8000/train/status    # 直至 state=finished
   外部锁与共享存储，未实现）。
 - 逐位一致仅保证同环境同构建（见上节）；未做跨机器/跨 torch 版本对齐。
 - 检查点只保留最新一份（原子替换保证新旧二选一）；未做历史版本保留/滚动清理。
-- `force=true` 启动新运行会**立即丢弃**旧检查点：若新运行在写出第一个检查点
-  前崩溃，则无点可恢复（状态回到 `idle`），只能重新开始——这是刻意语义，
-  避免"已丢弃的旧运行"在重启后被悄悄恢复。
+- `force=true` 启动新运行会丢弃旧检查点（先等旧作业的保存在飞结束，再删文件）：
+  若新运行在写出第一个检查点前崩溃，则无点可恢复（状态回到 `idle`），只能重新
+  开始——这是刻意语义，避免"已丢弃的旧运行"在重启后被悄悄恢复。
 - `GET /train/parameters` 取自最近**已持久化**检查点，运行中可能落后最多
   `checkpoint_every` 批；未提供"当前内存参数"下载（避免与训练线程竞争）。
 - 本环境无 docker，镜像构建与 compose 未实际执行；Dockerfile/compose 与本地实
   测使用完全相同的启动命令与依赖版本，但未在真实 Docker 中跑过验证脚本。
 - 暂停等待上限为 `pause_timeout_seconds`（默认 30s），超时返回 504，训练仍会
   在批边界停下，可轮询状态确认。
+- `resume`/`start` 等待在飞保存的上限同样取 `pause_timeout_seconds`；保存异常
+  缓慢时返回 409（明确拒绝），客户端可稍后重试——未做无限等待或排队取消。
